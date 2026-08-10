@@ -8145,6 +8145,8 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         A GitHub PR URL appears in a recent task comment (within
         ``_RESPAWN_GUARD_PR_WINDOW`` seconds).  A prior worker already
         opened a PR; re-spawning risks a duplicate PR on the same task.
+        Bypassed when an explicit re-queue event occurred after the most
+        recent ended run (or when there is no ended run).
 
     Stale / dead claim locks are NOT a guard reason — they are handled
     by ``release_stale_claims`` and ``detect_crashed_workers`` which
@@ -8227,6 +8229,23 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
             return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
+    #    An explicit re-queue after the latest ended run is intentional, so a
+    #    later comment that merely mentions the existing PR must not cancel it.
+    requeue_floor = (
+        int(latest_run["ended_at"])
+        if latest_run is not None and latest_run["ended_at"] is not None
+        else 0
+    )
+    intentional_requeue = conn.execute(
+        "SELECT 1 FROM task_events "
+        "WHERE task_id = ? AND created_at >= ? "
+        "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed') "
+        "LIMIT 1",
+        (task_id, requeue_floor),
+    ).fetchone()
+    if intentional_requeue:
+        return None
+
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
         "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",

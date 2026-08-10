@@ -501,6 +501,89 @@ def test_delete_task_removes_task_and_cascades(kanban_home):
 # Respawn guard (check_respawn_guard + dispatch_once integration)
 # ---------------------------------------------------------------------------
 
+def _insert_respawn_guard_run(conn, task_id: str, ended_at: int) -> None:
+    conn.execute(
+        "INSERT INTO task_runs "
+        "(task_id, status, started_at, ended_at, outcome) "
+        "VALUES (?, 'crashed', ?, ?, 'crashed')",
+        (task_id, ended_at - 1, ended_at),
+    )
+
+
+def _insert_respawn_guard_event(
+    conn, task_id: str, kind: str, created_at: int
+) -> None:
+    conn.execute(
+        "INSERT INTO task_events (task_id, kind, created_at) VALUES (?, ?, ?)",
+        (task_id, kind, created_at),
+    )
+
+
+def _insert_respawn_guard_pr_comment(
+    conn, task_id: str, created_at: int
+) -> None:
+    conn.execute(
+        "INSERT INTO task_comments (task_id, author, body, created_at) "
+        "VALUES (?, 'worker', 'Existing PR: https://github.com/acme/repo/pull/42', ?)",
+        (task_id, created_at),
+    )
+
+
+def test_respawn_guard_recent_pr_comment_returns_active_pr(kanban_home, monkeypatch):
+    now = 2_000_000_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="plain PR guard")
+        _insert_respawn_guard_pr_comment(conn, task_id, now - 10)
+        conn.commit()
+
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+
+
+def test_respawn_guard_requeue_after_latest_run_bypasses_later_pr_comment(
+    kanban_home, monkeypatch
+):
+    now = 2_000_000_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="intentional PR rerun")
+        _insert_respawn_guard_run(conn, task_id, now - 30)
+        _insert_respawn_guard_event(conn, task_id, "unblocked", now - 20)
+        _insert_respawn_guard_pr_comment(conn, task_id, now - 10)
+        conn.commit()
+
+        assert kb.check_respawn_guard(conn, task_id) is None
+
+
+def test_respawn_guard_requeue_before_latest_run_does_not_bypass_active_pr(
+    kanban_home, monkeypatch
+):
+    now = 2_000_000_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="crashed after old requeue")
+        _insert_respawn_guard_event(conn, task_id, "status", now - 30)
+        _insert_respawn_guard_run(conn, task_id, now - 20)
+        _insert_respawn_guard_pr_comment(conn, task_id, now - 10)
+        conn.commit()
+
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+
+
+def test_respawn_guard_requeue_without_ended_run_bypasses_active_pr(
+    kanban_home, monkeypatch
+):
+    now = 2_000_000_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="intentional first run")
+        _insert_respawn_guard_event(conn, task_id, "promoted", now - 20)
+        _insert_respawn_guard_pr_comment(conn, task_id, now - 10)
+        conn.commit()
+
+        assert kb.check_respawn_guard(conn, task_id) is None
+
+
 
 
 
