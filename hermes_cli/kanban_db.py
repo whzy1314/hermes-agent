@@ -1361,6 +1361,10 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     delivery_metadata TEXT,
     created_at    INTEGER NOT NULL,
     last_event_id INTEGER NOT NULL DEFAULT 0,
+    last_delivery_event_id INTEGER,
+    last_delivery_kind TEXT,
+    last_delivery_message_id TEXT,
+    last_delivered_at INTEGER,
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
@@ -2522,6 +2526,14 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             _add_column_if_missing(
                 conn, "kanban_notify_subs", "delivery_metadata", "delivery_metadata TEXT"
             )
+        for column, definition in (
+            ("last_delivery_event_id", "last_delivery_event_id INTEGER"),
+            ("last_delivery_kind", "last_delivery_kind TEXT"),
+            ("last_delivery_message_id", "last_delivery_message_id TEXT"),
+            ("last_delivered_at", "last_delivered_at INTEGER"),
+        ):
+            if column not in notify_cols:
+                _add_column_if_missing(conn, "kanban_notify_subs", column, definition)
 
     # One-shot backfill: any task that is 'running' before runs existed
     # had its claim_lock / claim_expires / worker_pid on the task row.
@@ -2646,7 +2658,8 @@ _REBUILD_SPECS = {
         " task_id TEXT NOT NULL, platform TEXT NOT NULL, chat_id TEXT NOT NULL,"
         " chat_type TEXT, thread_id TEXT NOT NULL DEFAULT '', user_id TEXT,"
         " notifier_profile TEXT, delivery_metadata TEXT, created_at INTEGER NOT NULL,"
-        " last_event_id INTEGER NOT NULL DEFAULT 0,"
+        " last_event_id INTEGER NOT NULL DEFAULT 0, last_delivery_event_id INTEGER,"
+        " last_delivery_kind TEXT, last_delivery_message_id TEXT, last_delivered_at INTEGER,"
         " PRIMARY KEY (task_id, platform, chat_id, thread_id))",
         ("CREATE INDEX idx_notify_task ON kanban_notify_subs(task_id)",),
     ),
@@ -9970,6 +9983,50 @@ def remove_notify_sub(
             (task_id, platform, chat_id, thread_id or ""),
         )
     return cur.rowcount > 0
+
+
+def record_notify_delivery(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str],
+    event_id: int,
+    event_kind: str,
+    message_id: Optional[str],
+    delivered_at: Optional[int] = None,
+) -> bool:
+    """Persist the latest confirmed platform delivery receipt for a subscription.
+
+    ``last_event_id`` proves only that a watcher claimed an event. This receipt
+    is written after ``adapter.send()`` reports success and retains the platform
+    message id when the adapter provides one.
+    """
+    when = int(delivered_at if delivered_at is not None else time.time())
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE kanban_notify_subs SET last_delivery_event_id = ?, "
+            "last_delivery_kind = ?, last_delivery_message_id = ?, last_delivered_at = ? "
+            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
+            "AND (last_delivery_event_id IS NULL OR last_delivery_event_id <= ?)",
+            (
+                int(event_id), str(event_kind),
+                str(message_id) if message_id is not None else None,
+                when, task_id, platform, chat_id, thread_id or "", int(event_id),
+            ),
+        )
+        if cur.rowcount == 1:
+            return True
+        # A later concurrent delivery may have recorded a newer event first.
+        # Treat that monotonic no-op as success; distinguish it from a removed
+        # subscription so callers can still surface genuine audit gaps.
+        row = conn.execute(
+            "SELECT 1 FROM kanban_notify_subs WHERE task_id = ? AND platform = ? "
+            "AND chat_id = ? AND thread_id = ?",
+            (task_id, platform, chat_id, thread_id or ""),
+        ).fetchone()
+    return row is not None
 
 
 def unseen_events_for_sub(

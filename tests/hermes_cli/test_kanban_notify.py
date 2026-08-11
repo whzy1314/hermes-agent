@@ -43,6 +43,59 @@ def _assert_inherited_notify_sub(subs: list[dict]) -> None:
 
 
 
+def test_record_notify_delivery_persists_auditable_receipt(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="receipt", assignee="worker")
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat1", thread_id="10010",
+        )
+        assert kb.record_notify_delivery(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat1",
+            thread_id="10010",
+            event_id=123,
+            event_kind="blocked",
+            message_id="456",
+            delivered_at=789,
+        )
+        sub = kb.list_notify_subs(conn, tid)[0]
+    finally:
+        conn.close()
+
+    assert sub["last_delivery_event_id"] == 123
+    assert sub["last_delivery_kind"] == "blocked"
+    assert sub["last_delivery_message_id"] == "456"
+    assert sub["last_delivered_at"] == 789
+
+
+def test_record_notify_delivery_never_regresses_to_older_event(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="monotonic receipt", assignee="worker")
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat1", thread_id="10010",
+        )
+        assert kb.record_notify_delivery(
+            conn, task_id=tid, platform="telegram", chat_id="chat1", thread_id="10010",
+            event_id=124, event_kind="completed", message_id="newer", delivered_at=800,
+        )
+        assert kb.record_notify_delivery(
+            conn, task_id=tid, platform="telegram", chat_id="chat1", thread_id="10010",
+            event_id=123, event_kind="blocked", message_id="older", delivered_at=900,
+        )
+        sub = kb.list_notify_subs(conn, tid)[0]
+    finally:
+        conn.close()
+
+    assert sub["last_delivery_event_id"] == 124
+    assert sub["last_delivery_kind"] == "completed"
+    assert sub["last_delivery_message_id"] == "newer"
+    assert sub["last_delivered_at"] == 800
+
+
 # ---------------------------------------------------------------------------
 # Regression: gateway watchers must not double-init the kanban DB.
 #

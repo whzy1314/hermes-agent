@@ -24,6 +24,21 @@ class RecordingAdapter:
         self.handled.append(event)
 
 
+class ReceiptAdapter:
+    def __init__(self):
+        self.sent = []
+        self.handled = []
+
+    async def send(self, chat_id, text, metadata=None):
+        from gateway.platforms.base import SendResult
+
+        self.sent.append({"chat_id": chat_id, "text": text, "metadata": metadata or {}})
+        return SendResult(success=True, message_id="telegram-msg-321")
+
+    async def handle_message(self, event):
+        self.handled.append(event)
+
+
 class DisconnectedAdapters(dict):
     """Expose a platform during collection, then simulate disconnect on get()."""
 
@@ -165,6 +180,37 @@ def test_active_named_profile_subscription_is_delivered(tmp_path, monkeypatch):
     message = adapter.sent[0]["text"]
     assert tid in message
     assert "blocked" in message
+
+
+def test_notifier_persists_confirmed_platform_message_id(tmp_path, monkeypatch):
+    db_path = tmp_path / "delivery-receipt.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="auditable delivery", assignee="worker")
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat-1", thread_id="10010",
+        )
+        kb.block_task(conn, tid, reason="Human input", kind="needs_input")
+        event_id = conn.execute(
+            "SELECT MAX(id) FROM task_events WHERE task_id = ?", (tid,)
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+    adapter = ReceiptAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    conn = kb.connect()
+    try:
+        sub = kb.list_notify_subs(conn, tid)[0]
+    finally:
+        conn.close()
+    assert sub["last_delivery_event_id"] == event_id
+    assert sub["last_delivery_kind"] == "blocked"
+    assert sub["last_delivery_message_id"] == "telegram-msg-321"
+    assert isinstance(sub["last_delivered_at"], int)
 
 
 def test_non_dispatch_gateway_claims_only_its_profile_subscriptions(
