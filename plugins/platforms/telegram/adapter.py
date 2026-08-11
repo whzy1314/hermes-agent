@@ -1440,6 +1440,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 and self._is_bad_request_error(send_err)
                 and self._is_thread_not_found_error(send_err)
                 and not (metadata or {}).get("telegram_dm_topic_created_for_send")
+                and (metadata or {}).get("chat_type") == "dm"
                 and send_kwargs.get("direct_messages_topic_id") is None
             ):
                 logger.warning(
