@@ -438,6 +438,51 @@ async def test_native_media_dm_topic_reply_not_found_retry_drops_thread_id(
 
 
 @pytest.mark.asyncio
+async def test_document_stale_plain_thread_retries_without_thread(tmp_path):
+    adapter = _make_adapter()
+    path = tmp_path / "request.txt"
+    path.write_text("support request", encoding="utf-8")
+    calls = []
+
+    async def mock_send_document(**kwargs):
+        calls.append(dict(kwargs))
+        if len(calls) == 1:
+            raise FakeBadRequest("Message thread not found")
+        return SimpleNamespace(message_id=991)
+
+    adapter._bot = SimpleNamespace(send_document=mock_send_document)
+    result = await adapter.send_document(
+        chat_id="123", file_path=str(path), metadata={"thread_id": "9799"},
+    )
+
+    assert result.success is True
+    assert result.message_id == "991"
+    assert calls[0]["message_thread_id"] == 9799
+    assert "message_thread_id" not in calls[1]
+
+
+@pytest.mark.asyncio
+async def test_document_created_private_topic_never_falls_back_to_root(tmp_path):
+    adapter = _make_adapter()
+    path = tmp_path / "request.txt"
+    path.write_text("support request", encoding="utf-8")
+    calls = []
+
+    async def mock_send_document(**kwargs):
+        calls.append(dict(kwargs))
+        raise FakeBadRequest("Message thread not found")
+
+    adapter._bot = SimpleNamespace(send_document=mock_send_document)
+    await adapter.send_document(
+        chat_id="123",
+        file_path=str(path),
+        metadata={"thread_id": "9799", "telegram_dm_topic_created_for_send": True},
+    )
+
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_animation_dm_topic_reply_not_found_retry_drops_thread_id():
     adapter = _make_adapter()
     call_log = []

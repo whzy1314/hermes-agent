@@ -558,6 +558,24 @@ class GatewayKanbanWatchersMixin:
                                     "adapter send() reported failure: "
                                     f"{getattr(_send_res, 'error', None) or 'unknown error'}"
                                 )
+                            try:
+                                await asyncio.to_thread(
+                                    self._kanban_record_delivery,
+                                    sub,
+                                    event_id=int(ev.id),
+                                    event_kind=kind,
+                                    message_id=getattr(_send_res, "message_id", None),
+                                    board=board_slug,
+                                )
+                            except Exception as receipt_exc:
+                                # The platform send already succeeded. Never
+                                # rewind and duplicate it merely because audit
+                                # persistence failed; surface the gap loudly.
+                                logger.error(
+                                    "kanban notifier: delivered %s for %s but could not "
+                                    "persist its receipt: %s",
+                                    kind, sub["task_id"], receipt_exc,
+                                )
                             logger.debug(
                                 "kanban notifier: delivered %s event for %s to %s/%s on board %s",
                                 kind, sub["task_id"], platform_str, sub["chat_id"], board_slug,
@@ -797,6 +815,34 @@ class GatewayKanbanWatchersMixin:
                 if not self._running:
                     return
                 await asyncio.sleep(1)
+
+    def _kanban_record_delivery(
+        self,
+        sub: dict,
+        *,
+        event_id: int,
+        event_kind: str,
+        message_id: Optional[str],
+        board: Optional[str] = None,
+    ) -> None:
+        """Persist a successful platform send receipt. Runs in ``to_thread``."""
+        from hermes_cli import kanban_db as _kb
+
+        conn = _kb.connect(board=board)
+        try:
+            if not _kb.record_notify_delivery(
+                conn,
+                task_id=sub["task_id"],
+                platform=sub["platform"],
+                chat_id=sub["chat_id"],
+                thread_id=sub.get("thread_id") or "",
+                event_id=event_id,
+                event_kind=event_kind,
+                message_id=message_id,
+            ):
+                raise RuntimeError("notification subscription disappeared before receipt write")
+        finally:
+            conn.close()
 
     def _kanban_advance(
         self, sub: dict, cursor: int, board: Optional[str] = None,
