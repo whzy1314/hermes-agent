@@ -10008,14 +10008,25 @@ def record_notify_delivery(
         cur = conn.execute(
             "UPDATE kanban_notify_subs SET last_delivery_event_id = ?, "
             "last_delivery_kind = ?, last_delivery_message_id = ?, last_delivered_at = ? "
-            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
+            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
+            "AND (last_delivery_event_id IS NULL OR last_delivery_event_id <= ?)",
             (
                 int(event_id), str(event_kind),
                 str(message_id) if message_id is not None else None,
-                when, task_id, platform, chat_id, thread_id or "",
+                when, task_id, platform, chat_id, thread_id or "", int(event_id),
             ),
         )
-    return cur.rowcount == 1
+        if cur.rowcount == 1:
+            return True
+        # A later concurrent delivery may have recorded a newer event first.
+        # Treat that monotonic no-op as success; distinguish it from a removed
+        # subscription so callers can still surface genuine audit gaps.
+        row = conn.execute(
+            "SELECT 1 FROM kanban_notify_subs WHERE task_id = ? AND platform = ? "
+            "AND chat_id = ? AND thread_id = ?",
+            (task_id, platform, chat_id, thread_id or ""),
+        ).fetchone()
+    return row is not None
 
 
 def unseen_events_for_sub(
