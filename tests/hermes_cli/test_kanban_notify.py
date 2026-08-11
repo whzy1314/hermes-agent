@@ -96,6 +96,58 @@ def test_record_notify_delivery_never_regresses_to_older_event(kanban_home):
     assert sub["last_delivered_at"] == 800
 
 
+def test_delivery_receipt_survives_terminal_unsubscribe(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="durable receipt", assignee="worker")
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat1", thread_id="10010",
+        )
+        assert kb.record_notify_delivery(
+            conn, task_id=tid, platform="telegram", chat_id="chat1", thread_id="10010",
+            event_id=125, event_kind="completed", message_id="msg-125",
+        )
+        assert kb.remove_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat1", thread_id="10010",
+        )
+        assert kb.has_notify_delivery(
+            conn, task_id=tid, platform="telegram", chat_id="chat1", thread_id="10010",
+            event_id=125,
+        )
+        row = conn.execute(
+            "SELECT message_id FROM kanban_notify_deliveries WHERE task_id = ?",
+            (tid,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert row["message_id"] == "msg-125"
+
+
+def test_delivery_receipt_can_be_written_after_subscription_removed(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="receipt race", assignee="worker")
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat1", thread_id="10010",
+        )
+        assert kb.remove_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat1", thread_id="10010",
+        )
+        assert kb.record_notify_delivery(
+            conn, task_id=tid, platform="telegram", chat_id="chat1", thread_id="10010",
+            event_id=126, event_kind="completed", message_id="msg-126",
+        )
+        row = conn.execute(
+            "SELECT message_id FROM kanban_notify_deliveries WHERE task_id = ?",
+            (tid,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert row["message_id"] == "msg-126"
+
+
 # ---------------------------------------------------------------------------
 # Regression: gateway watchers must not double-init the kanban DB.
 #

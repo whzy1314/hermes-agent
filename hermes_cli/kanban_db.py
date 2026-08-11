@@ -1368,6 +1368,22 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- Durable, per-event delivery ledger. Unlike kanban_notify_subs this table is
+-- intentionally retained after terminal-task unsubscribe so delivery can be
+-- audited and already-confirmed sends can be skipped on partial-batch retry.
+CREATE TABLE IF NOT EXISTS kanban_notify_deliveries (
+    task_id       TEXT NOT NULL,
+    platform      TEXT NOT NULL,
+    chat_id       TEXT NOT NULL,
+    thread_id     TEXT NOT NULL DEFAULT '',
+    event_id      INTEGER NOT NULL,
+    event_kind    TEXT NOT NULL,
+    delivery_key TEXT NOT NULL DEFAULT 'text',
+    message_id    TEXT,
+    delivered_at INTEGER NOT NULL,
+    PRIMARY KEY (task_id, platform, chat_id, thread_id, event_id, delivery_key)
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -1378,6 +1394,7 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+CREATE INDEX IF NOT EXISTS idx_notify_delivery_task  ON kanban_notify_deliveries(task_id, event_id);
 """
 
 
@@ -9996,16 +10013,32 @@ def record_notify_delivery(
     event_kind: str,
     message_id: Optional[str],
     delivered_at: Optional[int] = None,
+    delivery_key: str = "text",
 ) -> bool:
-    """Persist the latest confirmed platform delivery receipt for a subscription.
+    """Persist a durable receipt and refresh ephemeral subscription telemetry.
 
     ``last_event_id`` proves only that a watcher claimed an event. This receipt
     is written after ``adapter.send()`` reports success and retains the platform
-    message id when the adapter provides one.
+    message id when the adapter provides one. The durable ledger write does not
+    depend on the subscription row still existing: terminal unsubscribe and a
+    concurrent receipt writer may race, but confirmed delivery remains auditable.
     """
     when = int(delivered_at if delivered_at is not None else time.time())
     with write_txn(conn):
-        cur = conn.execute(
+        conn.execute(
+            "INSERT INTO kanban_notify_deliveries (task_id, platform, chat_id, "
+            "thread_id, event_id, event_kind, delivery_key, message_id, delivered_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(task_id, platform, chat_id, thread_id, event_id, delivery_key) "
+            "DO UPDATE SET message_id = COALESCE(excluded.message_id, message_id), "
+            "delivered_at = MIN(delivered_at, excluded.delivered_at)",
+            (
+                task_id, platform, chat_id, thread_id or "", int(event_id),
+                str(event_kind), str(delivery_key),
+                str(message_id) if message_id is not None else None, when,
+            ),
+        )
+        conn.execute(
             "UPDATE kanban_notify_subs SET last_delivery_event_id = ?, "
             "last_delivery_kind = ?, last_delivery_message_id = ?, last_delivered_at = ? "
             "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
@@ -10016,16 +10049,31 @@ def record_notify_delivery(
                 when, task_id, platform, chat_id, thread_id or "", int(event_id),
             ),
         )
-        if cur.rowcount == 1:
-            return True
-        # A later concurrent delivery may have recorded a newer event first.
-        # Treat that monotonic no-op as success; distinguish it from a removed
-        # subscription so callers can still surface genuine audit gaps.
-        row = conn.execute(
-            "SELECT 1 FROM kanban_notify_subs WHERE task_id = ? AND platform = ? "
-            "AND chat_id = ? AND thread_id = ?",
-            (task_id, platform, chat_id, thread_id or ""),
-        ).fetchone()
+        # A zero-row update is expected when a later delivery already owns
+        # the convenience fields or terminal cleanup removed the subscription.
+        # The ledger insert above is the authoritative success criterion.
+    return True
+
+
+def has_notify_delivery(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str],
+    event_id: int,
+    delivery_key: str = "text",
+) -> bool:
+    """Return whether a durable receipt exists for one event delivery part."""
+    row = conn.execute(
+        "SELECT 1 FROM kanban_notify_deliveries WHERE task_id = ? AND platform = ? "
+        "AND chat_id = ? AND thread_id = ? AND event_id = ? AND delivery_key = ?",
+        (
+            task_id, platform, chat_id, thread_id or "", int(event_id),
+            str(delivery_key),
+        ),
+    ).fetchone()
     return row is not None
 
 

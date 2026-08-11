@@ -452,7 +452,8 @@ async def test_document_stale_plain_thread_retries_without_thread(tmp_path):
 
     adapter._bot = SimpleNamespace(send_document=mock_send_document)
     result = await adapter.send_document(
-        chat_id="123", file_path=str(path), metadata={"thread_id": "9799"},
+        chat_id="123", file_path=str(path),
+        metadata={"thread_id": "9799", "chat_type": "dm"},
     )
 
     assert result.success is True
@@ -480,6 +481,33 @@ async def test_document_created_private_topic_never_falls_back_to_root(tmp_path)
     )
 
     assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "media_label",
+    ["document", "photo", "video", "voice", "audio", "media group", "animation"],
+)
+async def test_group_and_forum_media_never_fall_back_to_root(media_label):
+    """The shared native-media retry helper must fail closed outside a DM."""
+    adapter = _make_adapter()
+    calls = []
+
+    async def failing_send(**kwargs):
+        calls.append(dict(kwargs))
+        raise FakeBadRequest("Message thread not found")
+
+    with pytest.raises(FakeBadRequest):
+        await adapter._send_with_dm_topic_reply_anchor_retry(
+            failing_send,
+            {"chat_id": -100123, "message_thread_id": 9799},
+            {"thread_id": "9799", "chat_type": "forum"},
+            None,
+            media_label,
+        )
+
+    assert len(calls) == 1
+    assert calls[0]["message_thread_id"] == 9799
 
 
 @pytest.mark.asyncio

@@ -1,4 +1,5 @@
 import asyncio
+import json
 import sqlite3
 from pathlib import Path
 
@@ -37,6 +38,41 @@ class ReceiptAdapter:
 
     async def handle_message(self, event):
         self.handled.append(event)
+
+
+class PartialBatchAdapter:
+    def __init__(self):
+        self.sent = []
+        self.calls = 0
+
+    async def send(self, chat_id, text, metadata=None):
+        from gateway.platforms.base import SendResult
+
+        self.calls += 1
+        self.sent.append(text)
+        if self.calls == 2:
+            return SendResult(success=False, error="later event failed")
+        return SendResult(success=True, message_id=f"msg-{self.calls}")
+
+
+class RetryingArtifactAdapter:
+    def __init__(self):
+        self.sent = []
+        self.documents = []
+
+    async def send(self, chat_id, text, metadata=None):
+        from gateway.platforms.base import SendResult
+
+        self.sent.append(text)
+        return SendResult(success=True, message_id="text-1")
+
+    async def send_document(self, chat_id, file_path, metadata=None, **kwargs):
+        from gateway.platforms.base import SendResult
+
+        self.documents.append(file_path)
+        if len(self.documents) == 1:
+            return SendResult(success=False, error="upload rejected")
+        return SendResult(success=True, message_id="document-2")
 
 
 class DisconnectedAdapters(dict):
@@ -211,6 +247,90 @@ def test_notifier_persists_confirmed_platform_message_id(tmp_path, monkeypatch):
     assert sub["last_delivery_kind"] == "blocked"
     assert sub["last_delivery_message_id"] == "telegram-msg-321"
     assert isinstance(sub["last_delivered_at"], int)
+
+
+def test_partial_batch_retry_skips_already_confirmed_event(tmp_path, monkeypatch):
+    db_path = tmp_path / "partial-batch.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="partial batch", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb._append_event(conn, tid, kind="blocked", payload={"reason": "first"})
+        kb._append_event(conn, tid, kind="blocked", payload={"reason": "second"})
+    finally:
+        conn.close()
+
+    adapter = PartialBatchAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert sum("first" in text for text in adapter.sent) == 1
+    assert sum("second" in text for text in adapter.sent) == 2
+
+
+def test_artifact_failure_rewinds_then_retries_without_duplicate_text(tmp_path, monkeypatch):
+    db_path = tmp_path / "artifact-retry.db"
+    artifact = tmp_path / "deliverable.txt"
+    artifact.write_text("payload", encoding="utf-8")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_MEDIA_ALLOW_DIRS", str(tmp_path))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="artifact retry", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb.complete_task(conn, tid, summary="deliver artifact")
+        event_id = conn.execute(
+            "SELECT MAX(id) FROM task_events WHERE task_id = ? AND kind = 'completed'",
+            (tid,),
+        ).fetchone()[0]
+        conn.execute(
+            "UPDATE task_events SET payload = ? WHERE id = ?",
+            (json.dumps({"summary": "deliver artifact", "artifacts": [str(artifact)]}), event_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    adapter = RetryingArtifactAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    conn = kb.connect()
+    try:
+        assert len(kb.list_notify_subs(conn, tid)) == 1
+        assert kb.has_notify_delivery(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="",
+            event_id=event_id,
+            delivery_key="text",
+        )
+    finally:
+        conn.close()
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    assert adapter.documents == [str(artifact), str(artifact)]
+    conn = kb.connect()
+    try:
+        assert kb.list_notify_subs(conn, tid) == []
+        rows = conn.execute(
+            "SELECT delivery_key, message_id FROM kanban_notify_deliveries "
+            "WHERE task_id = ? ORDER BY delivery_key",
+            (tid,),
+        ).fetchall()
+    finally:
+        conn.close()
+    receipts = {row["delivery_key"]: row["message_id"] for row in rows}
+    assert receipts["text"] == "text-1"
+    artifact_keys = [key for key in receipts if key.startswith("artifact:")]
+    assert len(artifact_keys) == 1
+    assert receipts[artifact_keys[0]] == "document-2"
 
 
 def test_non_dispatch_gateway_claims_only_its_profile_subscriptions(
